@@ -1,0 +1,8 @@
+build/
+imsg
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+.DS_Store
+allowlist
