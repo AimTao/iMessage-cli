@@ -33,7 +33,7 @@ enum Sender {
         }
     }
 
-    private static func isMessagesRunning() -> Bool {
+    static func isMessagesRunning() -> Bool {
         let script = """
         tell application "System Events"
             return (name of processes) contains "Messages"

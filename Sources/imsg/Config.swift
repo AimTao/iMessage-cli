@@ -5,7 +5,6 @@ import Foundation
 enum IMSGError: Error, CustomStringConvertible {
     case databaseNotAccessible(String)
     case messagesNotRunning
-    case notAuthorized(String)
     case contactNotFound(String)
     case notInAllowlist(String)
     case allowlistEmpty
@@ -18,8 +17,6 @@ enum IMSGError: Error, CustomStringConvertible {
             return "无法访问消息数据库: \(path)\n请确保终端有完全磁盘访问权限（系统设置 → 隐私与安全性 → 完全磁盘访问权限）"
         case .messagesNotRunning:
             return "Messages.app 未运行。请先打开 Messages.app"
-        case .notAuthorized(let detail):
-            return "权限不足: \(detail)"
         case .contactNotFound(let id):
             return "找不到联系人: \(id)"
         case .notInAllowlist(let id):

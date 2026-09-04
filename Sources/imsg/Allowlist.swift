@@ -3,10 +3,6 @@ import Foundation
 struct AllowlistEntry {
     let handle: String   // 原始号码或邮箱（归一化后）
     let alias: String?   // 手动指定的别名，nil 表示用通讯录名
-
-    var displayName: String {
-        alias ?? handle
-    }
 }
 
 struct Allowlist {

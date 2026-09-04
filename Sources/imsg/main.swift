@@ -168,19 +168,10 @@ func cmdDoctor() throws {
     }
 
     // 4. Messages.app
-    let script = """
-    tell application "System Events"
-        return (name of processes) contains "Messages"
-    end tell
-    """
-    if let scriptObj = NSAppleScript(source: script) {
-        var error: NSDictionary?
-        let result = scriptObj.executeAndReturnError(&error)
-        if result.booleanValue {
-            print("✓ Messages.app 正在运行")
-        } else {
-            print("⚠ Messages.app 未运行（发送消息前需要启动）")
-        }
+    if Sender.isMessagesRunning() {
+        print("✓ Messages.app 正在运行")
+    } else {
+        print("⚠ Messages.app 未运行（发送消息前需要启动）")
     }
 
     print(String(repeating: "─", count: 40))
@@ -377,13 +368,8 @@ func printHistory(_ messages: [Message], myName: String, otherName: String) {
 
 /// Messages.app 未运行则拉起
 func ensureMessagesRunning() {
-    let script = "tell application \"System Events\" to return (name of processes) contains \"Messages\""
-    if let obj = NSAppleScript(source: script) {
-        var err: NSDictionary?
-        let res = obj.executeAndReturnError(&err)
-        if !res.booleanValue {
-            Sender.launchMessagesIfNeeded()
-        }
+    if !Sender.isMessagesRunning() {
+        Sender.launchMessagesIfNeeded()
     }
 }
 

@@ -1,23 +1,18 @@
 import Foundation
 import SQLite3
 
-struct Chat: Identifiable {
+struct Chat {
     let id: Int64
-    let identifier: String    // chat_identifier, e.g. "iMessage;-;+86138..."
-    let displayName: String?  // 群聊名称或 nil
     let lastMessageDate: Date?
-    let service: String       // "iMessage" or "SMS"
     let isGroup: Bool
     let participants: [String] // handles
 }
 
-struct Message: Identifiable {
+struct Message {
     let id: Int64
-    let chatId: Int64
     let text: String
     let date: Date
     let isFromMe: Bool
-    let senderHandle: String?
     let hasAttachments: Bool
     let tapbackType: Int      // 0 = 普通消息；2000-2006 = 回应(tapback)
     let tapbackEmoji: String? // type == 2006 时的自定义表情
@@ -113,9 +108,6 @@ final class MessageDB {
     func recentChats(limit: Int = 20) throws -> [Chat] {
         let sql = """
         SELECT c.ROWID,
-               c.chat_identifier,
-               c.display_name,
-               c.service_name,
                c.style,
                MAX(m.date) as last_date
         FROM chat c
@@ -135,20 +127,13 @@ final class MessageDB {
         var chats: [Chat] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
-            let identifier = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-            let displayName = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
-            let service = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "iMessage"
-            let style = sqlite3_column_int(stmt, 4) // 43=group, 45=direct
-            let lastDate = timestampToDate(sqlite3_column_int64(stmt, 5))
-            let participants = participantsForChat(chatId: id)
+            let style = sqlite3_column_int(stmt, 1) // 43=group, 45=direct
+            let lastDate = timestampToDate(sqlite3_column_int64(stmt, 2))
             chats.append(Chat(
                 id: id,
-                identifier: identifier,
-                displayName: displayName,
                 lastMessageDate: lastDate,
-                service: service,
                 isGroup: style == 43,
-                participants: participants
+                participants: participantsForChat(chatId: id)
             ))
         }
         return chats
@@ -178,10 +163,9 @@ final class MessageDB {
     func messages(forChat chatId: Int64, limit: Int = 50) throws -> [Message] {
         let sql = """
         SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me,
-               m.cache_has_attachments, h.id, m.associated_message_type, m.associated_message_emoji
+               m.cache_has_attachments, m.associated_message_type, m.associated_message_emoji
         FROM message m
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-        LEFT JOIN handle h ON h.ROWID = m.handle_id
         WHERE cmj.chat_id = ?
         ORDER BY m.date DESC, m.ROWID DESC
         LIMIT ?
@@ -209,17 +193,14 @@ final class MessageDB {
             let date = timestampToDate(sqlite3_column_int64(stmt, 3)) ?? Date(timeIntervalSince1970: 0)
             let isFromMe = sqlite3_column_int(stmt, 4) == 1
             let hasAttachments = sqlite3_column_int(stmt, 5) == 1
-            let senderHandle = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
-            let tapbackType = sqlite3_column_int(stmt, 7)
-            let tapbackEmoji = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
+            let tapbackType = sqlite3_column_int(stmt, 6)
+            let tapbackEmoji = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
 
             messages.append(Message(
                 id: id,
-                chatId: chatId,
                 text: text.isEmpty ? (hasAttachments ? "[图片]" : "") : text,
                 date: date,
                 isFromMe: isFromMe,
-                senderHandle: senderHandle,
                 hasAttachments: hasAttachments,
                 tapbackType: Int(tapbackType),
                 tapbackEmoji: tapbackEmoji
@@ -234,7 +215,7 @@ final class MessageDB {
     func findChat(forHandle handle: String) throws -> Chat? {
         let normalized = Handle.normalize(handle)
         let sql = """
-        SELECT c.ROWID, c.chat_identifier, c.display_name, c.service_name, c.style
+        SELECT c.ROWID, c.style
         FROM chat c
         JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
         JOIN handle h ON h.ROWID = chj.handle_id
@@ -249,19 +230,12 @@ final class MessageDB {
 
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         let id = sqlite3_column_int64(stmt, 0)
-        let identifier = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-        let displayName = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
-        let service = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "iMessage"
-        let style = sqlite3_column_int(stmt, 4)
-        let participants = participantsForChat(chatId: id)
+        let style = sqlite3_column_int(stmt, 1)
         return Chat(
             id: id,
-            identifier: identifier,
-            displayName: displayName,
             lastMessageDate: nil,
-            service: service,
             isGroup: style == 43,
-            participants: participants
+            participants: participantsForChat(chatId: id)
         )
     }
 
