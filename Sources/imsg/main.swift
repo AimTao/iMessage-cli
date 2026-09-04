@@ -21,8 +21,6 @@ func ansi(_ code: String, _ s: String) -> String {
     useColor ? "\u{001B}[\(code)m\(s)\u{001B}[0m" : s
 }
 
-let uiSeparator = String(repeating: "─", count: 60)
-
 func uiHeader(contact: String) {
     let cwd = FileManager.default.currentDirectoryPath
     print("▗ ▗   ▖ ▖  imsg v\(appVersion)")
@@ -42,19 +40,73 @@ func messageBody(_ msg: Message) -> String {
     return msg.text
 }
 
-/// 单条消息的 turn 块（前置分隔线 + 发送者/时间 + 缩进正文）
+/// 单条消息的 turn（发送者/时间头部顶格 + 正文缩进 6 空格，无分隔线）
 func renderTurn(_ msg: Message, myName: String, otherName: String) -> String {
     let time = displayDateFormatter.string(from: msg.date)
-    var out = ansi("2", uiSeparator) + "\n"
-    if msg.isFromMe {
-        out += "  \(ansi("1;36", "❯")) \(ansi("1", "你")) · \(ansi("2", time))\n"
-    } else {
-        out += "  \(ansi("1", otherName)) · \(ansi("2", time))\n"
-    }
+    let header = msg.isFromMe
+        ? "\(ansi("1;36", "❯")) \(ansi("1", "你")) · \(ansi("2", time))"
+        : "\(ansi("1", otherName)) · \(ansi("2", time))"
+    var lines = [header]
     for line in messageBody(msg).components(separatedBy: "\n") {
-        out += "  \(line)\n"
+        lines.append("      \(line)")
     }
-    return out
+    return lines.joined(separator: "\n")
+}
+
+// MARK: - 原始模式输入（自己处理回显与退格）
+
+/// 进入原始模式，返回原 termios；用 defer restoreTerminal 恢复
+func enableRawMode() -> termios {
+    var orig = termios()
+    tcgetattr(STDIN_FILENO, &orig)
+    var raw = orig
+    raw.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG | IEXTEN)
+    raw.c_iflag &= ~tcflag_t(IXON)
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
+    return orig
+}
+
+func restoreTerminal(_ t: termios) {
+    var copy = t
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &copy)
+}
+
+/// 直接写字节到 stdout（绕过 stdio 缓冲，避免与 print 交错乱序）
+func writeOut(_ s: String) {
+    s.utf8CString.withUnsafeBufferPointer { buf in
+        _ = write(STDOUT_FILENO, buf.baseAddress, buf.count - 1)
+    }
+    fflush(stdout)
+}
+
+/// 清空当前行（回车到行首 + 擦除到行尾）
+func clearLine() {
+    writeOut("\r\u{1B}[2K")
+}
+
+/// 删除字节数组末尾一个完整 UTF-8 字符（中文多字节，不能只删一个字节）
+func dropLastUTF8Char(_ bytes: inout [UInt8]) {
+    guard !bytes.isEmpty else { return }
+    var idx = bytes.count - 1
+    while idx > 0 && (bytes[idx] & 0xC0) == 0x80 { idx -= 1 }
+    bytes.removeSubrange(idx..<bytes.count)
+}
+
+func inputDisplay(_ bytes: [UInt8]) -> String {
+    // 只取可解码的 UTF-8 前缀，末尾未完成的字节序列暂不显示（正在敲中文多字节字符时）
+    var b = bytes
+    while !b.isEmpty {
+        if let s = String(bytes: b, encoding: .utf8) { return s }
+        b.removeLast()
+    }
+    return ""
+}
+
+/// 重绘当前提示符行（清行 + ❯ + 已输入内容）
+func redrawPrompt(_ bytes: [UInt8]) {
+    clearLine()
+    writeOut("❯ " + inputDisplay(bytes))
+    fflush(stdout)
 }
 
 // MARK: - Name resolution
@@ -162,7 +214,6 @@ func cmdChats(allowlist: Allowlist) throws {
 func cmdShow(_ target: String, count: Int, allowlist: Allowlist) throws {
     guard !allowlist.isEmpty else { throw IMSGError.allowlistEmpty }
 
-    // 解析目标
     guard let handle = allowlist.resolveAlias(target) ?? Optional(Handle.normalize(target)),
           allowlist.contains(handle) else {
         throw IMSGError.notInAllowlist(target)
@@ -176,14 +227,10 @@ func cmdShow(_ target: String, count: Int, allowlist: Allowlist) throws {
     let messages = try db.messages(forChat: chat.id, limit: count)
     let name = resolveName(for: handle, allowlist: allowlist)
 
-    // 打开会话即同步已读
     db.markChatRead(chatId: chat.id)
 
     uiHeader(contact: name)
-    for msg in messages {
-        print(renderTurn(msg, myName: "你", otherName: name))
-    }
-    print(ansi("2", uiSeparator))
+    printHistory(messages, myName: "你", otherName: name)
 }
 
 func cmdSend(_ target: String, text: String, allowlist: Allowlist) throws {
@@ -194,17 +241,7 @@ func cmdSend(_ target: String, text: String, allowlist: Allowlist) throws {
         throw IMSGError.notInAllowlist(target)
     }
 
-    // 如果 Messages 没运行，尝试拉起
-    let script = "tell application \"System Events\" to return (name of processes) contains \"Messages\""
-    if let scriptObj = NSAppleScript(source: script) {
-        var error: NSDictionary?
-        let result = scriptObj.executeAndReturnError(&error)
-        if !result.booleanValue {
-            print("Messages.app 未运行，正在启动...")
-            Sender.launchMessagesIfNeeded()
-        }
-    }
-
+    ensureMessagesRunning()
     try Sender.send(to: handle, text: text)
     print("已发送 → \(resolveName(for: handle, allowlist: allowlist))")
 }
@@ -224,81 +261,88 @@ func cmdChat(_ target: String, count: Int, allowlist: Allowlist) throws {
 
     let name = resolveName(for: handle, allowlist: allowlist)
 
-    // 显示最近消息
     let messages = try db.messages(forChat: chat.id, limit: count)
     uiHeader(contact: name)
-    for msg in messages {
-        print(renderTurn(msg, myName: "你", otherName: name))
-    }
-    print(ansi("2", uiSeparator))
+    printHistory(messages, myName: "你", otherName: name)
 
-    // 打开会话即同步已读
     db.markChatRead(chatId: chat.id)
+    ensureMessagesRunning()
 
-    // 如果 Messages 没运行，拉起
-    let checkScript = "tell application \"System Events\" to return (name of processes) contains \"Messages\""
-    if let scriptObj = NSAppleScript(source: checkScript) {
-        var error: NSDictionary?
-        let result = scriptObj.executeAndReturnError(&error)
-        if !result.booleanValue {
-            print("Messages.app 未运行，正在启动...")
-            Sender.launchMessagesIfNeeded()
-        }
-    }
-
-    // 进入交互循环
     var lastMessageId = messages.last?.id ?? 0
+    var inputBytes: [UInt8] = []
+    var lastPoll = Date()
 
-    // 初始提示符（只打一次，避免累积）
-    print("❯ ", terminator: "")
+    // 进入原始模式前，把 stdio 缓冲的头部/历史先冲出去，避免与 write 交错乱序
     fflush(stdout)
+    let orig = enableRawMode()
+    defer { restoreTerminal(orig) }
+
+    redrawPrompt(inputBytes)
 
     while true {
-        // 轮询新消息
-        var printedNew = false
-        if let newMessages = try? pollNewMessages(db: db, chatId: chat.id, after: lastMessageId),
-           !newMessages.isEmpty {
-            print("") // 结束当前提示符行
-            for msg in newMessages {
-                print(renderTurn(msg, myName: "你", otherName: name))
-                if msg.id > lastMessageId { lastMessageId = msg.id }
+        // 1. 读输入（原始模式，逐字节）
+        var fds = [pollfd(fd: 0, events: Int16(POLLIN), revents: 0)]
+        if poll(&fds, 1, 100) > 0, (fds[0].revents & Int16(POLLIN)) != 0 {
+            var buf = [UInt8](repeating: 0, count: 32)
+            let n = buf.withUnsafeMutableBytes { read(STDIN_FILENO, $0.baseAddress, 32) }
+            if n > 0 {
+                for i in 0..<n {
+                    let c = buf[i]
+                    switch c {
+                    case 0x0d, 0x0a: // Enter
+                        let text = String(bytes: inputBytes, encoding: .utf8) ?? ""
+                        inputBytes.removeAll()
+                        let trimmed = text.trimmingCharacters(in: .whitespaces)
+                        clearLine()
+                        if trimmed.isEmpty {
+                            writeOut("已退出\n")
+                            return
+                        }
+                        do {
+                            try Sender.send(to: handle, text: trimmed)
+                            if let msgs = try? db.messages(forChat: chat.id, limit: 1),
+                               let last = msgs.last, last.id > lastMessageId {
+                                writeOut(renderTurn(last, myName: "你", otherName: name) + "\n")
+                                lastMessageId = last.id
+                            }
+                        } catch {
+                            writeOut("发送失败: \(error)\n")
+                        }
+                        redrawPrompt(inputBytes)
+                    case 0x7f, 0x08: // 退格
+                        dropLastUTF8Char(&inputBytes)
+                        redrawPrompt(inputBytes)
+                    case 0x03: // Ctrl+C
+                        writeOut("\n")
+                        return
+                    case 0x04: // Ctrl+D
+                        if inputBytes.isEmpty {
+                            writeOut("\n已退出\n")
+                            return
+                        }
+                    default:
+                        if c >= 0x20 || c == 0x09 {
+                            inputBytes.append(c)
+                            redrawPrompt(inputBytes)
+                        }
+                    }
+                }
             }
-            printedNew = true
         }
 
-        // 读取输入（1 秒超时）
-        guard let line = readLineWithTimeout(seconds: 1) else {
-            // 超时：仅当有输出才重打提示符
-            if printedNew {
-                print("❯ ", terminator: "")
-                fflush(stdout)
+        // 2. 每秒轮询新消息
+        if Date().timeIntervalSince(lastPoll) >= 1.0 {
+            lastPoll = Date()
+            if let newMessages = try? pollNewMessages(db: db, chatId: chat.id, after: lastMessageId),
+               !newMessages.isEmpty {
+                clearLine()
+                for msg in newMessages {
+                    writeOut(renderTurn(msg, myName: "你", otherName: name) + "\n")
+                    if msg.id > lastMessageId { lastMessageId = msg.id }
+                }
+                redrawPrompt(inputBytes)
             }
-            continue
         }
-
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty {
-            // 空行退出
-            print("已退出")
-            return
-        }
-
-        do {
-            try Sender.send(to: handle, text: trimmed)
-            // 立即取最新消息作为已发内容显示，并推进游标，避免轮询重复显示
-            if let msgs = try? db.messages(forChat: chat.id, limit: 1),
-               let last = msgs.last, last.id > lastMessageId {
-                print("")
-                print(renderTurn(last, myName: "你", otherName: name))
-                lastMessageId = last.id
-            }
-        } catch {
-            print("发送失败: \(error)")
-        }
-
-        // 重新打印提示符
-        print("❯ ", terminator: "")
-        fflush(stdout)
     }
 }
 
@@ -323,14 +367,24 @@ func pollNewMessages(db: MessageDB, chatId: Int64, after lastId: Int64) throws -
     return all.filter { $0.id > lastId }
 }
 
-/// 带超时的 readLine（非阻塞轮询用）
-func readLineWithTimeout(seconds: Int) -> String? {
-    var fds = [pollfd(fd: 0, events: Int16(POLLIN), revents: 0)]
-    let ret = poll(&fds, 1, Int32(seconds * 1000))
-    if ret > 0 && (fds[0].revents & Int16(POLLIN)) != 0 {
-        return readLine(strippingNewline: true)
+/// 打印一批消息（turn 之间空行分隔，无横线）
+func printHistory(_ messages: [Message], myName: String, otherName: String) {
+    for msg in messages {
+        print(renderTurn(msg, myName: myName, otherName: otherName))
+        print("")
     }
-    return nil
+}
+
+/// Messages.app 未运行则拉起
+func ensureMessagesRunning() {
+    let script = "tell application \"System Events\" to return (name of processes) contains \"Messages\""
+    if let obj = NSAppleScript(source: script) {
+        var err: NSDictionary?
+        let res = obj.executeAndReturnError(&err)
+        if !res.booleanValue {
+            Sender.launchMessagesIfNeeded()
+        }
+    }
 }
 
 // MARK: - Main
