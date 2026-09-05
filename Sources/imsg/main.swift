@@ -202,13 +202,18 @@ func cmdChats(allowlist: Allowlist) throws {
     }
 }
 
-func cmdShow(_ target: String, count: Int, allowlist: Allowlist) throws {
+/// 校验目标联系人在白名单内，返回归一化后的 handle（show/send/chat 共用）
+func resolveHandle(_ target: String, allowlist: Allowlist) throws -> String {
     guard !allowlist.isEmpty else { throw IMSGError.allowlistEmpty }
-
     guard let handle = allowlist.resolveAlias(target) ?? Optional(Handle.normalize(target)),
           allowlist.contains(handle) else {
         throw IMSGError.notInAllowlist(target)
     }
+    return handle
+}
+
+func cmdShow(_ target: String, count: Int, allowlist: Allowlist) throws {
+    let handle = try resolveHandle(target, allowlist: allowlist)
 
     let db = try MessageDB()
     guard let chat = try db.findChat(forHandle: handle) else {
@@ -225,12 +230,7 @@ func cmdShow(_ target: String, count: Int, allowlist: Allowlist) throws {
 }
 
 func cmdSend(_ target: String, text: String, allowlist: Allowlist) throws {
-    guard !allowlist.isEmpty else { throw IMSGError.allowlistEmpty }
-
-    guard let handle = allowlist.resolveAlias(target) ?? Optional(Handle.normalize(target)),
-          allowlist.contains(handle) else {
-        throw IMSGError.notInAllowlist(target)
-    }
+    let handle = try resolveHandle(target, allowlist: allowlist)
 
     ensureMessagesRunning()
     try Sender.send(to: handle, text: text)
@@ -238,12 +238,7 @@ func cmdSend(_ target: String, text: String, allowlist: Allowlist) throws {
 }
 
 func cmdChat(_ target: String, count: Int, allowlist: Allowlist) throws {
-    guard !allowlist.isEmpty else { throw IMSGError.allowlistEmpty }
-
-    guard let handle = allowlist.resolveAlias(target) ?? Optional(Handle.normalize(target)),
-          allowlist.contains(handle) else {
-        throw IMSGError.notInAllowlist(target)
-    }
+    let handle = try resolveHandle(target, allowlist: allowlist)
 
     let db = try MessageDB()
     guard let chat = try db.findChat(forHandle: handle) else {
@@ -272,7 +267,7 @@ func cmdChat(_ target: String, count: Int, allowlist: Allowlist) throws {
 
     while true {
         // 1. 读输入（原始模式，逐字节）
-        var fds = [pollfd(fd: 0, events: Int16(POLLIN), revents: 0)]
+        var fds = [pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)]
         if poll(&fds, 1, 100) > 0, (fds[0].revents & Int16(POLLIN)) != 0 {
             var buf = [UInt8](repeating: 0, count: 32)
             let n = buf.withUnsafeMutableBytes { read(STDIN_FILENO, $0.baseAddress, 32) }
@@ -324,7 +319,7 @@ func cmdChat(_ target: String, count: Int, allowlist: Allowlist) throws {
         // 2. 每秒轮询新消息
         if Date().timeIntervalSince(lastPoll) >= 1.0 {
             lastPoll = Date()
-            if let newMessages = try? pollNewMessages(db: db, chatId: chat.id, after: lastMessageId),
+            if let newMessages = try? db.newMessages(forChat: chat.id, after: lastMessageId),
                !newMessages.isEmpty {
                 clearLine()
                 for msg in newMessages {
@@ -351,11 +346,6 @@ func tapbackEmoji(for type: Int, custom: String?) -> String? {
     case 2006: return custom
     default: return nil
     }
-}
-
-func pollNewMessages(db: MessageDB, chatId: Int64, after lastId: Int64) throws -> [Message] {
-    let all = try db.messages(forChat: chatId, limit: 100)
-    return all.filter { $0.id > lastId }
 }
 
 /// 打印一批消息（turn 之间空行分隔，无横线）

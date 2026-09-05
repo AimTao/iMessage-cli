@@ -124,46 +124,94 @@ final class MessageDB {
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, Int64(limit))
 
-        var chats: [Chat] = []
+        // 先取会话（不含 participants），再一次批量取参与者，避免每个会话一条查询（N+1）
+        var rows: [(id: Int64, style: Int, lastDate: Date?)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let id = sqlite3_column_int64(stmt, 0)
-            let style = sqlite3_column_int(stmt, 1) // 43=group, 45=direct
-            let lastDate = timestampToDate(sqlite3_column_int64(stmt, 2))
-            chats.append(Chat(
-                id: id,
-                lastMessageDate: lastDate,
-                isGroup: style == 43,
-                participants: participantsForChat(chatId: id)
+            rows.append((
+                id: sqlite3_column_int64(stmt, 0),
+                style: Int(sqlite3_column_int(stmt, 1)), // 43=group, 45=direct
+                lastDate: timestampToDate(sqlite3_column_int64(stmt, 2))
             ))
         }
-        return chats
+        let participants = participantsForChats(chatIds: rows.map { $0.id })
+        return rows.map {
+            Chat(
+                id: $0.id,
+                lastMessageDate: $0.lastDate,
+                isGroup: $0.style == 43,
+                participants: participants[$0.id] ?? []
+            )
+        }
     }
 
-    private func participantsForChat(chatId: Int64) -> [String] {
+    /// 批量查多个会话的参与者（单次查询），返回 [chatId: handles]
+    private func participantsForChats(chatIds: [Int64]) -> [Int64: [String]] {
+        guard !chatIds.isEmpty else { return [:] }
+        let placeholders = Array(repeating: "?", count: chatIds.count).joined(separator: ",")
         let sql = """
-        SELECT h.id FROM handle h
+        SELECT chj.chat_id, h.id FROM handle h
         JOIN chat_handle_join chj ON chj.handle_id = h.ROWID
-        WHERE chj.chat_id = ?
+        WHERE chj.chat_id IN (\(placeholders))
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int64(stmt, 1, chatId)
-        var handles: [String] = []
+        for (i, id) in chatIds.enumerated() {
+            sqlite3_bind_int64(stmt, Int32(i + 1), id)
+        }
+        var result: [Int64: [String]] = [:]
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let ptr = sqlite3_column_text(stmt, 0) {
-                handles.append(String(cString: ptr))
+            let chatId = sqlite3_column_int64(stmt, 0)
+            if let ptr = sqlite3_column_text(stmt, 1) {
+                result[chatId, default: []].append(String(cString: ptr))
             }
         }
-        return handles
+        return result
+    }
+
+    /// 单个会话的参与者（findChat 使用，复用批量查询）
+    private func participantsForChat(chatId: Int64) -> [String] {
+        participantsForChats(chatIds: [chatId])[chatId] ?? []
     }
 
     // MARK: - Query messages
 
+    /// message 查询的公共列（text 为空时回退 attributedBody 解码）
+    private static let messageColumns = """
+    m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me,
+    m.cache_has_attachments, m.associated_message_type, m.associated_message_emoji
+    """
+
+    private func mapMessage(_ stmt: OpaquePointer?) -> Message {
+        let id = sqlite3_column_int64(stmt, 0)
+        var text = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+        // text 为空时尝试从 attributedBody 解码
+        if text.isEmpty, let blobPtr = sqlite3_column_blob(stmt, 2) {
+            let blobSize = sqlite3_column_bytes(stmt, 2)
+            text = Self.decodeAttributedBody(Data(bytes: blobPtr, count: Int(blobSize)))
+        }
+        // 替换附件占位符 U+FFFC
+        text = text.replacingOccurrences(of: "\u{FFFC}", with: " [图片] ")
+        let date = timestampToDate(sqlite3_column_int64(stmt, 3)) ?? Date(timeIntervalSince1970: 0)
+        let isFromMe = sqlite3_column_int(stmt, 4) == 1
+        let hasAttachments = sqlite3_column_int(stmt, 5) == 1
+        let tapbackType = sqlite3_column_int(stmt, 6)
+        let tapbackEmoji = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+
+        return Message(
+            id: id,
+            text: text.isEmpty ? (hasAttachments ? "[图片]" : "") : text,
+            date: date,
+            isFromMe: isFromMe,
+            hasAttachments: hasAttachments,
+            tapbackType: Int(tapbackType),
+            tapbackEmoji: tapbackEmoji
+        )
+    }
+
     func messages(forChat chatId: Int64, limit: Int = 50) throws -> [Message] {
         let sql = """
-        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me,
-               m.cache_has_attachments, m.associated_message_type, m.associated_message_emoji
+        SELECT \(Self.messageColumns)
         FROM message m
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         WHERE cmj.chat_id = ?
@@ -180,34 +228,36 @@ final class MessageDB {
 
         var messages: [Message] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let id = sqlite3_column_int64(stmt, 0)
-            var text = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-            // text 为空时尝试从 attributedBody 解码
-            if text.isEmpty, let blobPtr = sqlite3_column_blob(stmt, 2) {
-                let blobSize = sqlite3_column_bytes(stmt, 2)
-                let data = Data(bytes: blobPtr, count: Int(blobSize))
-                text = Self.decodeAttributedBody(data)
-            }
-            // 替换附件占位符 U+FFFC
-            text = text.replacingOccurrences(of: "\u{FFFC}", with: " [图片] ")
-            let date = timestampToDate(sqlite3_column_int64(stmt, 3)) ?? Date(timeIntervalSince1970: 0)
-            let isFromMe = sqlite3_column_int(stmt, 4) == 1
-            let hasAttachments = sqlite3_column_int(stmt, 5) == 1
-            let tapbackType = sqlite3_column_int(stmt, 6)
-            let tapbackEmoji = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
-
-            messages.append(Message(
-                id: id,
-                text: text.isEmpty ? (hasAttachments ? "[图片]" : "") : text,
-                date: date,
-                isFromMe: isFromMe,
-                hasAttachments: hasAttachments,
-                tapbackType: Int(tapbackType),
-                tapbackEmoji: tapbackEmoji
-            ))
+            messages.append(mapMessage(stmt))
         }
-        // 查询取最近 N 条（DESC），反转为时间正序返回，供展示与轮询使用
+        // 查询取最近 N 条（DESC），反转为时间正序返回，供展示使用
         return messages.reversed()
+    }
+
+    /// 只取 ROWID 大于 after 的新消息（升序），供 chat 轮询增量拉取，避免每秒重查重解码
+    func newMessages(forChat chatId: Int64, after id: Int64, limit: Int = 100) throws -> [Message] {
+        let sql = """
+        SELECT \(Self.messageColumns)
+        FROM message m
+        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+        WHERE cmj.chat_id = ? AND m.ROWID > ?
+        ORDER BY m.ROWID
+        LIMIT ?
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw IMSGError.unsupportedSchema("message 查询失败")
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, chatId)
+        sqlite3_bind_int64(stmt, 2, id)
+        sqlite3_bind_int64(stmt, 3, Int64(limit))
+
+        var messages: [Message] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            messages.append(mapMessage(stmt))
+        }
+        return messages
     }
 
     // MARK: - Find chat by handle

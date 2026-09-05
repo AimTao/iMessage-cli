@@ -9,9 +9,13 @@ enum Sender {
             throw IMSGError.messagesNotRunning
         }
 
+        // AppleScript 字符串转义：反斜杠、双引号，以及换行/回车/制表符（否则会破坏脚本）
         let escapedText = text
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
 
         let script = """
         tell application "Messages"
